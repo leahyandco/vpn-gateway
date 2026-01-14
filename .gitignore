@@ -1,0 +1,24 @@
+# OS files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Sensitive VPN configs (users should add their own)
+*.ovpn
+*.conf
+auth.txt
+*.key
+*.crt
+*.pem

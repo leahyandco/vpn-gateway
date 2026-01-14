@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN Gateway Kill Switch Firewall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-gateway-firewall
+RemainAfterExit=yes
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

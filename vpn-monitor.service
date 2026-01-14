@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN Gateway Connection Monitor
+After=network-online.target vpn-gateway-firewall.service
+Wants=network-online.target
+Requires=vpn-gateway-firewall.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vpn-monitor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
