@@ -76,6 +76,14 @@ if ip link show "$VPN_INTERFACE" > /dev/null 2>&1; then
     
     # NAT traffic from LAN through VPN
     iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$VPN_INTERFACE" -j MASQUERADE
+
+    # Clamp TCP MSS to the tunnel path MTU. Without this, 1500-byte client
+    # packets are too large for the tunnel (wg0 ~1420) and dropped ICMP
+    # frag-needed causes PMTUD black-holing: small packets pass, large
+    # transfers stall, producing slow + intermittent failures. Clamping
+    # client SYNs to the tunnel path MTU keeps every segment small enough.
+    iptables -t mangle -A FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" \
+        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 else
     echo "WARNING: VPN interface $VPN_INTERFACE is DOWN - traffic will be blocked (kill switch active)"
 fi
