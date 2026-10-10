@@ -1,154 +1,121 @@
 #!/bin/bash
+#
+# Shows how the VPN gateway is doing. Installed as vpn-gateway-status.
 
-# VPN Gateway Status Script
+CONF=/etc/vpn-gateway.conf
+LEASES=/var/lib/misc/dnsmasq.leases
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
-YELLOW='\033[1;33m'
+BOLD='\033[1m'
 NC='\033[0m'
 
-echo "======================================"
-echo "VPN Gateway Status"
-echo "======================================"
-echo ""
+good() { printf "    %-16s ${GREEN}%s${NC}\n" "$1" "$2"; }
+bad() { printf "    %-16s ${RED}%s${NC}\n" "$1" "$2"; PROBLEMS=$((PROBLEMS + 1)); }
+note() { printf "    %-16s %s\n" "$1" "$2"; }
+section() { echo; echo -e "${BOLD}$1${NC}"; }
 
-if [ ! -f /etc/vpn-gateway.conf ]; then
-    echo -e "${RED}Error: Gateway not configured. Run install.sh first.${NC}"
+running() { systemctl is-active --quiet "$1"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this as root: sudo vpn-gateway-status" >&2
     exit 1
 fi
-
-source /etc/vpn-gateway.conf
-
-# Determine VPN interface
-if [ "$VPN_TYPE" = "openvpn" ]; then
-    VPN_INTERFACE="tun0"
-elif [ "$VPN_TYPE" = "wireguard" ]; then
-    VPN_INTERFACE="wg0"
+if [ ! -f "$CONF" ]; then
+    echo "The gateway isn't installed yet, run install.sh first" >&2
+    exit 1
 fi
+# shellcheck source=/dev/null
+. "$CONF"
 
-echo -e "${GREEN}Configuration:${NC}"
-echo "  VPN Type: $VPN_TYPE"
-echo "  LAN Interface: $LAN_INTERFACE"
-echo "  LAN Subnet: $LAN_SUBNET"
-echo "  Gateway IP: $GATEWAY_IP"
-echo "  VPN Interface: $VPN_INTERFACE"
-echo ""
+PROBLEMS=0
 
-# Check VPN service
-echo -e "${GREEN}VPN Service:${NC}"
-if systemctl is-active --quiet "$VPN_SERVICE"; then
-    echo -e "  Status: ${GREEN}Running${NC}"
-    
-    # Get service uptime
-    UPTIME=$(systemctl show "$VPN_SERVICE" --property=ActiveEnterTimestamp --value)
-    echo "  Started: $UPTIME"
+section "VPN ($VPN_TYPE)"
+if running "$VPN_SERVICE"; then
+    good "Service" "running ($VPN_SERVICE)"
 else
-    echo -e "  Status: ${RED}Stopped${NC}"
+    bad "Service" "not running ($VPN_SERVICE)"
 fi
-
-# Check VPN interface
-echo -e "${GREEN}VPN Interface:${NC}"
-if ip link show "$VPN_INTERFACE" > /dev/null 2>&1; then
-    echo -e "  Status: ${GREEN}UP${NC}"
-    
-    # Get IP address
-    VPN_IP=$(ip -4 addr show "$VPN_INTERFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
-    if [ -n "$VPN_IP" ]; then
-        echo "  IP Address: $VPN_IP"
-    fi
-    
-    # Get public IP through VPN
-    echo -n "  Public IP: "
-    PUBLIC_IP=$(timeout 5 curl -s --interface "$VPN_INTERFACE" https://ifconfig.me 2>/dev/null)
-    if [ -n "$PUBLIC_IP" ]; then
-        echo -e "${GREEN}$PUBLIC_IP${NC}"
+vpn_ip=$(ip -4 -o addr show dev "$VPN_INTERFACE" 2>/dev/null | awk '{print $4; exit}')
+if [ -n "$vpn_ip" ]; then
+    good "Tunnel" "$VPN_INTERFACE is up, $vpn_ip"
+    public_ip=$(curl -s --max-time 8 --interface "$VPN_INTERFACE" https://ifconfig.me)
+    if [ -n "$public_ip" ]; then
+        good "Public IP" "$public_ip"
     else
-        echo -e "${YELLOW}Could not determine${NC}"
+        bad "Public IP" "can't reach the internet through the tunnel"
     fi
 else
-    echo -e "  Status: ${RED}DOWN${NC}"
-    echo -e "  ${RED}KILL SWITCH ACTIVE - No traffic will pass!${NC}"
+    bad "Tunnel" "$VPN_INTERFACE is down, LAN devices have no internet"
 fi
 
-echo ""
-
-# Check kill switch firewall
-echo -e "${GREEN}Kill Switch Firewall:${NC}"
-if systemctl is-active --quiet vpn-gateway-firewall; then
-    echo -e "  Status: ${GREEN}Active${NC}"
+section "Kill switch"
+if running vpn-gateway-firewall; then
+    good "Firewall" "on"
 else
-    echo -e "  Status: ${RED}Inactive${NC}"
+    bad "Firewall" "off"
 fi
-
-# Check firewall rules
-FORWARD_RULES=$(iptables -L FORWARD -n | grep -c "$VPN_INTERFACE" || echo "0")
-if [ "$FORWARD_RULES" -gt 0 ]; then
-    echo -e "  Rules: ${GREEN}$FORWARD_RULES rules for $VPN_INTERFACE${NC}"
+if iptables -S FORWARD | grep -q '^-P FORWARD DROP'; then
+    good "Forwarding" "only through $VPN_INTERFACE, everything else dropped"
 else
-    echo -e "  Rules: ${RED}No rules found for $VPN_INTERFACE${NC}"
+    bad "Forwarding" "default policy isn't DROP"
 fi
-
-# Check default policy
-FORWARD_POLICY=$(iptables -L FORWARD | grep "Chain FORWARD" | grep -oP '\(policy \K\w+')
-if [ "$FORWARD_POLICY" = "DROP" ]; then
-    echo -e "  Default Policy: ${GREEN}DROP (Kill switch active)${NC}"
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then
+    good "IP forwarding" "on"
 else
-    echo -e "  Default Policy: ${YELLOW}$FORWARD_POLICY${NC}"
+    bad "IP forwarding" "off"
 fi
 
-echo ""
-
-# Check monitor service
-echo -e "${GREEN}VPN Monitor:${NC}"
-if systemctl is-active --quiet vpn-monitor; then
-    echo -e "  Status: ${GREEN}Running${NC}"
+section "LAN"
+lan_ip=$(ip -4 -o addr show dev "$LAN_INTERFACE" 2>/dev/null | awk '{print $4; exit}')
+if [ "$(cat "/sys/class/net/$LAN_INTERFACE/carrier" 2>/dev/null)" = 1 ]; then
+    good "Adapter" "$LAN_INTERFACE ${lan_ip:-no address}, cable connected"
 else
-    echo -e "  Status: ${YELLOW}Not running${NC}"
+    note "Adapter" "$LAN_INTERFACE ${lan_ip:-no address}, nothing plugged in"
 fi
-
-# Check IP forwarding
-echo -e "${GREEN}IP Forwarding:${NC}"
-if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ]; then
-    echo -e "  Status: ${GREEN}Enabled${NC}"
+if running dnsmasq; then
+    good "DHCP and DNS" "running, handing out $DHCP_START to $DHCP_END"
 else
-    echo -e "  Status: ${RED}Disabled${NC}"
+    bad "DHCP and DNS" "dnsmasq isn't running"
 fi
-
-echo ""
-
-# VPN connectivity test
-echo -e "${GREEN}VPN Connectivity:${NC}"
-if ip link show "$VPN_INTERFACE" > /dev/null 2>&1; then
-    echo -n "  Ping test (1.1.1.1): "
-    if ping -c 1 -W 2 -I "$VPN_INTERFACE" 1.1.1.1 > /dev/null 2>&1; then
-        echo -e "${GREEN}Success${NC}"
+if [ -f "$LEASES" ]; then
+    leases=$(awk -v now="$(date +%s)" '$1 == 0 || $1 > now' "$LEASES" | wc -l)
+    note "Devices" "$leases with a current lease"
+fi
+if command -v dig >/dev/null && running dnsmasq; then
+    answer=$(dig +short +time=3 +tries=1 @"$LAN_ADDRESS" example.com A 2>/dev/null | head -n1)
+    if [[ $answer =~ ^[0-9.]+$ ]]; then
+        good "DNS lookup" "working, via $UPSTREAM_DNS"
     else
-        echo -e "${RED}Failed${NC}"
+        bad "DNS lookup" "no answer from $UPSTREAM_DNS"
     fi
-    
-    echo -n "  DNS test: "
-    if nslookup google.com > /dev/null 2>&1; then
-        echo -e "${GREEN}Success${NC}"
-    else
-        echo -e "${RED}Failed${NC}"
-    fi
+fi
+
+section "WAN"
+wan_ip=$(ip -4 -o addr show dev "$WAN_INTERFACE" 2>/dev/null | awk '{print $4; exit}')
+if [ -n "$wan_ip" ]; then
+    good "Adapter" "$WAN_INTERFACE $wan_ip"
 else
-    echo -e "  ${RED}VPN interface down - cannot test${NC}"
+    bad "Adapter" "$WAN_INTERFACE has no address"
 fi
-
-echo ""
-
-# Show recent monitor log
-if [ -f /var/log/vpn-gateway-monitor.log ]; then
-    echo -e "${GREEN}Recent Monitor Log:${NC}"
-    tail -n 5 /var/log/vpn-gateway-monitor.log
-    echo ""
-fi
-
-echo "======================================"
-if ip link show "$VPN_INTERFACE" > /dev/null 2>&1; then
-    echo -e "${GREEN}VPN is connected and operational${NC}"
+if running ssh || running ssh.socket; then
+    good "SSH" "open on both adapters, port $SSH_PORTS"
 else
-    echo -e "${RED}VPN is disconnected - kill switch is blocking all traffic${NC}"
+    bad "SSH" "not running"
 fi
-echo "======================================"
+
+section "Monitor"
+if running vpn-gateway-monitor; then
+    good "Service" "running"
+else
+    bad "Service" "not running"
+fi
+echo "    Recent log:"
+journalctl -u vpn-gateway-monitor -n 5 --no-pager -o short 2>/dev/null | sed 's/^/      /'
+
+echo
+if [ "$PROBLEMS" -eq 0 ]; then
+    echo -e "${GREEN}Everything looks good.${NC}"
+else
+    echo -e "${RED}$PROBLEMS problem(s) found.${NC} Logs: sudo journalctl -u $VPN_SERVICE -u dnsmasq -u vpn-gateway-monitor"
+fi

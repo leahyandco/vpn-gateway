@@ -1,130 +1,95 @@
 #!/bin/bash
+#
+# Removes the VPN gateway. Your network config and SSH are left alone, and it
+# asks before removing the VPN config or any packages.
 
-# VPN Gateway Uninstallation Script
+set -u
 
-set -e
+CONF=/etc/vpn-gateway.conf
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m'
 
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}Error: This script must be run as root${NC}"
+info() { echo -e "${GREEN}==>${NC} $*"; }
+
+yes_no() {
+    local reply
+    read -r -p "$1 (y/n) [$2]: " reply || true
+    [[ ${reply:-$2} =~ ^[Yy] ]]
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}Error:${NC} run this as root, e.g. sudo ./uninstall.sh" >&2
     exit 1
 fi
 
-echo -e "${YELLOW}======================================${NC}"
-echo -e "${YELLOW}VPN Gateway Uninstallation${NC}"
-echo -e "${YELLOW}======================================${NC}"
-echo ""
-echo "This will:"
-echo "  - Stop VPN and firewall services"
-echo "  - Remove kill switch firewall rules"
-echo "  - Disable IP forwarding"
-echo "  - Remove configuration files"
-echo "  - Optionally remove VPN software"
-echo ""
-read -p "Continue with uninstallation? (y/n) " -n 1 -r
+echo "This removes the VPN gateway: the kill switch, DHCP and DNS for the LAN,"
+echo "the monitor and the VPN service. Devices on the LAN will lose internet."
 echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Uninstallation cancelled."
-    exit 0
+yes_no "Continue?" n || { echo "Cancelled."; exit 0; }
+
+VPN_SERVICE=
+if [ -f "$CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$CONF"
 fi
 
-# Load config if exists
-if [ -f /etc/vpn-gateway.conf ]; then
-    source /etc/vpn-gateway.conf
+info "Stopping services"
+for unit in vpn-gateway-monitor vpn-monitor dnsmasq $VPN_SERVICE vpn-gateway-firewall; do
+    systemctl disable -q --now "$unit" 2>/dev/null || true
+done
+
+info "Removing the firewall rules"
+echo 0 > /proc/sys/net/ipv4/ip_forward
+for ipt in iptables ip6tables; do
+    command -v "$ipt" >/dev/null || continue
+    $ipt -P INPUT ACCEPT
+    $ipt -P FORWARD ACCEPT
+    $ipt -P OUTPUT ACCEPT
+    $ipt -F INPUT
+    $ipt -F FORWARD
+    $ipt -F OUTPUT
+done
+iptables -t nat -F POSTROUTING 2>/dev/null
+iptables -t mangle -F FORWARD 2>/dev/null
+for chain in PREROUTING OUTPUT; do
+    iptables -t mangle -D "$chain" -j "vpngw-$chain" 2>/dev/null
+    iptables -t mangle -F "vpngw-$chain" 2>/dev/null
+    iptables -t mangle -X "vpngw-$chain" 2>/dev/null
+done
+while ip -4 rule del lookup 200 2>/dev/null; do :; done
+ip route flush table 200 2>/dev/null
+# The older version of this project saved its rules to load at boot
+if command -v netfilter-persistent >/dev/null; then
+    netfilter-persistent save >/dev/null 2>&1
 fi
 
-# Stop services
-echo -e "${GREEN}Stopping services...${NC}"
-systemctl stop vpn-monitor || true
-systemctl stop vpn-gateway-firewall || true
-
-if [ -n "$VPN_SERVICE" ]; then
-    systemctl stop "$VPN_SERVICE" || true
-    systemctl disable "$VPN_SERVICE" || true
-fi
-
-# Disable services
-echo -e "${GREEN}Disabling services...${NC}"
-systemctl disable vpn-monitor || true
-systemctl disable vpn-gateway-firewall || true
-
-# Remove firewall rules
-echo -e "${GREEN}Flushing firewall rules...${NC}"
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
-
-# Restore default policies
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
-
-# Save empty iptables
-if command -v netfilter-persistent &> /dev/null; then
-    netfilter-persistent save
-fi
-
-# Disable IP forwarding
-echo -e "${GREEN}Disabling IP forwarding...${NC}"
-rm -f /etc/sysctl.d/30-vpn-gateway.conf
-sysctl -w net.ipv4.ip_forward=0
-
-# Remove systemd services
-echo -e "${GREEN}Removing systemd services...${NC}"
-rm -f /etc/systemd/system/vpn-gateway-firewall.service
-rm -f /etc/systemd/system/vpn-monitor.service
+info "Removing files"
+rm -f /usr/local/bin/vpn-gateway-firewall \
+    /usr/local/bin/vpn-gateway-monitor \
+    /usr/local/bin/vpn-gateway-status \
+    /usr/local/bin/vpn-monitor \
+    /etc/systemd/system/vpn-gateway-firewall.service \
+    /etc/systemd/system/vpn-gateway-monitor.service \
+    /etc/systemd/system/vpn-monitor.service \
+    /etc/dnsmasq.d/vpn-gateway.conf \
+    /etc/sysctl.d/30-vpn-gateway.conf \
+    /var/log/vpn-gateway-monitor.log \
+    "$CONF"
+for unit in dnsmasq wg-quick@wg0 openvpn-client@vpn; do
+    rm -f "/etc/systemd/system/$unit.service.d/vpn-gateway.conf"
+    rmdir "/etc/systemd/system/$unit.service.d" 2>/dev/null
+done
 systemctl daemon-reload
 
-# Remove scripts
-rm -f /usr/local/bin/vpn-gateway-firewall
-rm -f /usr/local/bin/vpn-monitor
-
-# Remove configuration
-echo -e "${GREEN}Removing configuration files...${NC}"
-rm -f /etc/vpn-gateway.conf
-rm -f /var/log/vpn-gateway-monitor.log
-
-echo ""
-
-if [ -n "$VPN_TYPE" ]; then
-    read -p "Remove $VPN_TYPE software? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if [ "$VPN_TYPE" = "openvpn" ]; then
-            echo -e "${GREEN}Removing OpenVPN...${NC}"
-            apt-get remove -y openvpn openvpn-systemd-resolved
-            
-            read -p "Remove OpenVPN configuration files? (y/n) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                rm -rf /etc/openvpn/client
-            fi
-        elif [ "$VPN_TYPE" = "wireguard" ]; then
-            echo -e "${GREEN}Removing WireGuard...${NC}"
-            apt-get remove -y wireguard wireguard-tools
-            
-            read -p "Remove WireGuard configuration files? (y/n) " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                rm -rf /etc/wireguard
-            fi
-        fi
-        
-        apt-get autoremove -y
-    fi
+echo
+if yes_no "Delete the VPN config files? They contain your VPN keys or password." n; then
+    rm -f /etc/wireguard/wg0.conf /etc/openvpn/client/vpn.conf /etc/openvpn/client/vpn-auth.txt
+fi
+if yes_no "Remove the dnsmasq, WireGuard and OpenVPN packages?" n; then
+    apt-get remove -y dnsmasq wireguard-tools openvpn
 fi
 
-echo ""
-echo -e "${GREEN}======================================${NC}"
-echo -e "${GREEN}Uninstallation Complete!${NC}"
-echo -e "${GREEN}======================================${NC}"
-echo ""
-echo "VPN Gateway has been removed."
-echo "You may need to reboot client machines to restore normal network operation."
+echo
+info "Done. The LAN adapter keeps its static IP, change your network config if you want it back."

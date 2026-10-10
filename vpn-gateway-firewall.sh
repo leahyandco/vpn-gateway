@@ -1,109 +1,156 @@
 #!/bin/bash
+#
+# Kill switch firewall for the VPN gateway.
+#
+# Everything is dropped by default. Devices on the LAN can only get out
+# through the VPN tunnel. There's no rule letting them out the WAN, so if the
+# tunnel goes down their traffic is dropped instead of leaking out your real
+# connection.
+#
+# None of the rules depend on the tunnel being up, so this runs once at boot
+# before the network starts. IP forwarding is only switched on after the
+# rules are in place.
 
-# VPN Gateway Kill Switch Firewall
-# Blocks all traffic except through VPN tunnel
+set -eu
 
-set -e
-
-if [ ! -f /etc/vpn-gateway.conf ]; then
-    echo "Error: /etc/vpn-gateway.conf not found"
+CONF=/etc/vpn-gateway.conf
+if [ ! -f "$CONF" ]; then
+    echo "Error: $CONF not found, run install.sh first" >&2
     exit 1
 fi
+# shellcheck source=/dev/null
+. "$CONF"
 
-source /etc/vpn-gateway.conf
+WAN=$WAN_INTERFACE
+LAN=$LAN_INTERFACE
+VPN=$VPN_INTERFACE
 
-# Determine VPN interface
-if [ "$VPN_TYPE" = "openvpn" ]; then
-    VPN_INTERFACE="tun0"
-elif [ "$VPN_TYPE" = "wireguard" ]; then
-    VPN_INTERFACE="wg0"
+# Ports the gateway uses to reach the VPN server
+vpn_server_ports() {
+    case $VPN_TYPE in
+        wireguard)
+            awk -F= 'tolower($1) ~ /^[ \t]*endpoint[ \t]*$/ {
+                gsub(/[ \t]/, "", $2); n = split($2, a, ":"); print a[n]
+            }' "$VPN_CONFIG"
+            ;;
+        openvpn)
+            awk '
+                $1 == "port" || $1 == "rport" { port = $2 }
+                $1 == "remote" { if ($3 ~ /^[0-9]+$/) print $3; else bare = 1 }
+                END { if (bare) print (port ? port : 1194); else if (port) print port }
+            ' "$VPN_CONFIG"
+            ;;
+    esac | grep -E '^[0-9]+$' | sort -un
+}
+
+# Rules shared by IPv4 and IPv6. $1 is iptables or ip6tables.
+common_rules() {
+    local ipt=$1 port
+
+    # Policies go to DROP before the old rules are flushed so nothing gets
+    # through in between. Only the chains this script owns are flushed, so
+    # the rules wg-quick adds to the mangle and raw tables survive a re-run.
+    $ipt -P INPUT DROP
+    $ipt -P FORWARD DROP
+    $ipt -P OUTPUT DROP
+    $ipt -F INPUT
+    $ipt -F FORWARD
+    $ipt -F OUTPUT
+
+    $ipt -A INPUT -i lo -j ACCEPT
+    $ipt -A OUTPUT -o lo -j ACCEPT
+    $ipt -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    $ipt -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    $ipt -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # The gateway itself is open to the LAN (DHCP, DNS, SSH, ping)
+    $ipt -A INPUT -i "$LAN" -j ACCEPT
+    $ipt -A OUTPUT -o "$LAN" -j ACCEPT
+
+    # SSH on the WAN too, so it can be managed from the existing network
+    for port in $SSH_PORTS; do
+        $ipt -A INPUT -i "$WAN" -p tcp --dport "$port" -j ACCEPT
+    done
+
+    # dnsmasq answers DNS for the LAN. Its lookups route through the tunnel,
+    # and if the tunnel is down this stops them going out the WAN instead.
+    $ipt -A OUTPUT -o "$WAN" -m owner --uid-owner dnsmasq -j DROP
+
+    # What the gateway itself needs on the WAN to get the tunnel up: DNS to
+    # look up the VPN server, the time, and the VPN server.
+    $ipt -A OUTPUT -o "$WAN" -p udp --dport 53 -j ACCEPT
+    $ipt -A OUTPUT -o "$WAN" -p tcp --dport 53 -j ACCEPT
+    $ipt -A OUTPUT -o "$WAN" -p udp --dport 123 -j ACCEPT
+    if [ -n "$VPN_PORTS" ]; then
+        for port in $VPN_PORTS; do
+            $ipt -A OUTPUT -o "$WAN" -p udp --dport "$port" -j ACCEPT
+            if [ "$VPN_TYPE" = openvpn ]; then
+                $ipt -A OUTPUT -o "$WAN" -p tcp --dport "$port" -j ACCEPT
+            fi
+        done
+    else
+        $ipt -A OUTPUT -o "$WAN" -p udp -j ACCEPT
+        $ipt -A OUTPUT -o "$WAN" -p tcp -j ACCEPT
+    fi
+
+    # Anything the gateway sends through the tunnel is fine
+    $ipt -A OUTPUT -o "$VPN" -j ACCEPT
+}
+
+VPN_PORTS=$(vpn_server_ports | xargs)
+if [ -z "$VPN_PORTS" ]; then
+    echo "Warning: couldn't find the VPN server port in $VPN_CONFIG, allowing all TCP and UDP out $WAN" >&2
 fi
 
-# Get WAN interface (the one with default route, excluding VPN)
-WAN_INTERFACE=$(ip route | grep default | grep -v "$VPN_INTERFACE" | awk '{print $5}' | head -n1)
+# IPv4
+common_rules iptables
+iptables -A INPUT -i "$WAN" -p icmp --icmp-type echo-request -j ACCEPT
+iptables -A OUTPUT -o "$WAN" -p udp --dport 67 -j ACCEPT
 
-# Flush existing rules
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
+# LAN devices can only go out through the tunnel
+iptables -A FORWARD -i "$LAN" -o "$VPN" -j ACCEPT
+iptables -t nat -F POSTROUTING
+iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$VPN" -j MASQUERADE
 
-# Set default policies - DROP everything by default (KILL SWITCH)
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT DROP
+# Clamp TCP MSS to the tunnel's path MTU. Devices on the LAN send 1500 byte
+# packets, which are too big for the tunnel (wg0 is around 1420). If the ICMP
+# "fragmentation needed" replies get dropped along the way, path MTU discovery
+# breaks: small requests work but bigger transfers stall. Clamping the MSS on
+# outgoing SYNs makes every connection use segments that fit.
+iptables -t mangle -F FORWARD
+iptables -t mangle -A FORWARD -i "$LAN" -o "$VPN" -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --clamp-mss-to-pmtu
 
-# Allow loopback
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
-
-# Allow established connections
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-# Allow all traffic on LAN interface (for management)
-iptables -A INPUT -i "$LAN_INTERFACE" -j ACCEPT
-iptables -A OUTPUT -o "$LAN_INTERFACE" -j ACCEPT
-
-# Allow VPN connection establishment on WAN interface
-# This allows the VPN client to connect to VPN server
-if [ "$VPN_TYPE" = "openvpn" ]; then
-    # Allow OpenVPN traffic (usually UDP 1194 or TCP 443, but allow all to VPN server)
-    iptables -A OUTPUT -o "$WAN_INTERFACE" -p udp -j ACCEPT
-    iptables -A OUTPUT -o "$WAN_INTERFACE" -p tcp -j ACCEPT
-elif [ "$VPN_TYPE" = "wireguard" ]; then
-    # Allow WireGuard traffic (UDP 51820 or provider's port)
-    iptables -A OUTPUT -o "$WAN_INTERFACE" -p udp -j ACCEPT
+# Replies to connections that came in on the WAN, like SSH, have to go back
+# out the WAN instead of into the tunnel. Those connections get marked with
+# 51820 (0xca6c), the same mark WireGuard puts on its own packets so they skip
+# the tunnel (install.sh pins it with FwMark in wg0.conf). Marked packets also
+# use routing table 200, which the monitor fills with the WAN's routes. That
+# covers OpenVPN, which has no rule of its own for the mark.
+for chain in PREROUTING OUTPUT; do
+    iptables -t mangle -N "vpngw-$chain" 2>/dev/null || iptables -t mangle -F "vpngw-$chain"
+    iptables -t mangle -C "$chain" -j "vpngw-$chain" 2>/dev/null || iptables -t mangle -I "$chain" -j "vpngw-$chain"
+done
+iptables -t mangle -A vpngw-PREROUTING -i "$WAN" -m conntrack --ctstate NEW -j CONNMARK --set-mark 0xca6c
+iptables -t mangle -A vpngw-OUTPUT -m connmark --mark 0xca6c -j MARK --set-mark 0xca6c
+if ! ip -4 rule show | grep -q 'fwmark 0xca6c lookup 200'; then
+    ip -4 rule add pref 100 fwmark 0xca6c lookup 200
 fi
 
-# Allow DNS for VPN connection (to resolve VPN server hostname)
-iptables -A OUTPUT -o "$WAN_INTERFACE" -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -o "$WAN_INTERFACE" -p tcp --dport 53 -j ACCEPT
-
-# CRITICAL: Only allow traffic through VPN interface
-# If VPN is down, this interface won't exist and traffic will be blocked
-if ip link show "$VPN_INTERFACE" > /dev/null 2>&1; then
-    echo "VPN interface $VPN_INTERFACE is UP - allowing traffic"
-    
-    # Allow all output through VPN
-    iptables -A OUTPUT -o "$VPN_INTERFACE" -j ACCEPT
-    
-    # Allow forwarding from LAN to VPN
-    iptables -A FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" -j ACCEPT
-    
-    # NAT traffic from LAN through VPN
-    iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$VPN_INTERFACE" -j MASQUERADE
-
-    # Clamp TCP MSS to the tunnel path MTU. Without this, 1500-byte client
-    # packets are too large for the tunnel (wg0 ~1420) and dropped ICMP
-    # frag-needed causes PMTUD black-holing: small packets pass, large
-    # transfers stall, producing slow + intermittent failures. Clamping
-    # client SYNs to the tunnel path MTU keeps every segment small enough.
-    iptables -t mangle -A FORWARD -i "$LAN_INTERFACE" -o "$VPN_INTERFACE" \
-        -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-else
-    echo "WARNING: VPN interface $VPN_INTERFACE is DOWN - traffic will be blocked (kill switch active)"
+# IPv6. The LAN is IPv4 only and nothing gets forwarded, so devices can't
+# sneak around the tunnel over IPv6. The gateway keeps IPv6 on the WAN for SSH.
+if [ -d /proc/sys/net/ipv6 ]; then
+    common_rules ip6tables
+    ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+    ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT
+    ip6tables -A INPUT -i "$WAN" -p udp --dport 546 -j ACCEPT
+    ip6tables -A OUTPUT -o "$WAN" -p udp --dport 547 -j ACCEPT
 fi
 
-# Block all other forwarding (KILL SWITCH)
-# This ensures if VPN drops, no traffic leaks through WAN
-iptables -A FORWARD -o "$WAN_INTERFACE" -j DROP
-iptables -A OUTPUT -o "$WAN_INTERFACE" ! -p udp ! -p tcp -j DROP
+# Loose reverse path filtering. Strict mode drops replies that come back on
+# a different adapter to the one the routing table would pick, which breaks
+# SSH on the WAN while the tunnel holds the default route.
+echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+echo 1 > /proc/sys/net/ipv4/ip_forward
 
-# Log dropped packets (optional, for debugging)
-# iptables -A FORWARD -j LOG --log-prefix "VPN-FORWARD-DROP: " --log-level 4
-# iptables -A OUTPUT -j LOG --log-prefix "VPN-OUTPUT-DROP: " --log-level 4
-
-# Save rules
-if command -v netfilter-persistent &> /dev/null; then
-    netfilter-persistent save
-elif command -v iptables-save &> /dev/null; then
-    iptables-save > /etc/iptables/rules.v4
-fi
-
-echo "VPN Gateway kill switch firewall rules applied successfully"
-echo "Kill switch: Active - Traffic only allowed through $VPN_INTERFACE"
-exit 0
+echo "Kill switch on: LAN traffic can only leave through $VPN"
