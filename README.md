@@ -194,6 +194,16 @@ It stops and removes everything the installer added. It leaves your network conf
 | `/usr/local/bin/vpn-gateway-status` | Status check |
 | `/etc/systemd/system/vpn-gateway-*.service` | Services for the firewall and monitor |
 
+## Roadmap
+
+Next up is a web interface, so you can check on the gateway from a browser instead of over SSH. The plan:
+
+- **Overview.** Whether the tunnel is up, the public IP and server you're coming out of, how long it's been connected, and whether the kill switch is on.
+- **Devices.** Everything on the LAN, with its name, IP address and when it last got a lease.
+- **Statistics.** Traffic per device and in total over time, and a history of every time the VPN dropped and reconnected.
+
+If there's something you'd want on it, open an issue.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
